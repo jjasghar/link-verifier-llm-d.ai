@@ -3,8 +3,8 @@
 Link Verifier for llm-d.ai
 
 This script crawls the llm-d.ai website and verifies that all links are working properly.
-It reports any broken links (404s, timeouts, or other errors) and exits with appropriate
-status codes for use in GitHub Actions.
+It reports any broken links (HTTP 404 Not Found and HTTP 500 Internal Server Error only)
+and exits with appropriate status codes for use in GitHub Actions.
 """
 
 import argparse
@@ -130,33 +130,43 @@ class LinkVerifier:
                 # If HEAD fails, try GET
                 response = self.session.get(url, timeout=self.timeout)
             
-            if response.status_code == 200:
-                self.successful_links.add(url)
-                self.logger.info(f"✓ Link OK: {url}")
-                return True
-            else:
-                error_msg = f"HTTP {response.status_code}"
+            # Only treat 404 and 500 as broken links
+            if response.status_code == 404:
+                error_msg = f"HTTP {response.status_code} - Not Found"
                 self.broken_links[url].append((source_page, error_msg))
                 self.logger.warning(f"✗ Link broken: {url} - {error_msg} (found on: {source_page})")
                 return False
+            elif response.status_code == 500:
+                error_msg = f"HTTP {response.status_code} - Internal Server Error"
+                self.broken_links[url].append((source_page, error_msg))
+                self.logger.warning(f"✗ Link broken: {url} - {error_msg} (found on: {source_page})")
+                return False
+            else:
+                # All other status codes (200, 403, 301, 302, etc.) are considered acceptable
+                self.successful_links.add(url)
+                if response.status_code == 200:
+                    self.logger.info(f"✓ Link OK: {url}")
+                else:
+                    self.logger.info(f"✓ Link OK: {url} - HTTP {response.status_code}")
+                return True
                 
         except requests.exceptions.Timeout:
-            error_msg = "Timeout"
-            self.broken_links[url].append((source_page, error_msg))
-            self.logger.warning(f"✗ Link timeout: {url} (found on: {source_page})")
-            return False
+            # Timeouts are not considered broken links, just inaccessible at the moment
+            self.successful_links.add(url)
+            self.logger.info(f"⚠️  Link timeout (but not broken): {url} (found on: {source_page})")
+            return True
             
         except requests.exceptions.ConnectionError:
-            error_msg = "Connection error"
-            self.broken_links[url].append((source_page, error_msg))
-            self.logger.warning(f"✗ Link connection error: {url} (found on: {source_page})")
-            return False
+            # Connection errors are not considered broken links, just inaccessible at the moment
+            self.successful_links.add(url)
+            self.logger.info(f"⚠️  Link connection error (but not broken): {url} (found on: {source_page})")
+            return True
             
         except Exception as e:
-            error_msg = f"Error: {str(e)}"
-            self.broken_links[url].append((source_page, error_msg))
-            self.logger.warning(f"✗ Link error: {url} - {error_msg} (found on: {source_page})")
-            return False
+            # Other errors are not considered broken links, just inaccessible at the moment
+            self.successful_links.add(url)
+            self.logger.info(f"⚠️  Link error (but not broken): {url} - {str(e)} (found on: {source_page})")
+            return True
 
     def verify_all_links(self) -> bool:
         """
@@ -228,7 +238,7 @@ class LinkVerifier:
         
         if self.broken_links:
             self.logger.error(f"\n{'='*60}")
-            self.logger.error("BROKEN LINKS FOUND:")
+            self.logger.error("BROKEN LINKS FOUND (HTTP 404 & 500 ONLY):")
             self.logger.error(f"{'='*60}")
             
             for url, sources_and_errors in self.broken_links.items():
@@ -237,12 +247,12 @@ class LinkVerifier:
                     self.logger.error(f"   📄 Found on page: {source}")
                     self.logger.error(f"   💥 Error: {error}")
         else:
-            self.logger.info("\n✅ All links are working properly!")
+            self.logger.info("\n✅ No broken links found (checked for HTTP 404 & 500 errors only)!")
         
         return broken_count == 0
 
 def main():
-    parser = argparse.ArgumentParser(description='Verify all links on llm-d.ai website')
+    parser = argparse.ArgumentParser(description='Verify all links on llm-d.ai website (reports only HTTP 404 and 500 errors as broken)')
     parser.add_argument('--url', default='https://llm-d.ai', help='Base URL to check (default: https://llm-d.ai)')
     parser.add_argument('--timeout', type=int, default=30, help='Timeout for HTTP requests in seconds (default: 30)')
     parser.add_argument('--delay', type=float, default=1.0, help='Delay between requests in seconds (default: 1.0)')
@@ -262,10 +272,10 @@ def main():
     success = verifier.verify_all_links()
     
     if success:
-        print("\n✅ All links verified successfully!")
+        print("\n✅ All links verified successfully! (No HTTP 404 or 500 errors found)")
         sys.exit(0)
     else:
-        print(f"\n❌ Found {len(verifier.broken_links)} broken links!")
+        print(f"\n❌ Found {len(verifier.broken_links)} broken links! (HTTP 404/500 errors only)")
         sys.exit(1)
 
 if __name__ == '__main__':

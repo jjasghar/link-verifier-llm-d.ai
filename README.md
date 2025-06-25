@@ -1,13 +1,13 @@
 # llm-d Docs Link Verifier
 
-A Python application that verifies all links on the [llm-d.ai](https://llm-d.ai) website to ensure there are no broken links (404s, timeouts, or other errors). This tool can be run locally or as a daily GitHub Action.
+A Python application that verifies all links on the [llm-d.ai](https://llm-d.ai) website to ensure there are no broken links (only HTTP 404 Not Found and HTTP 500 Internal Server Error are considered broken). This tool can be run locally or as a daily GitHub Action.
 
 ## Features
 
 - 🔍 **Comprehensive Link Discovery**: Crawls the entire llm-d.ai website to find all internal and external links
 - 🌐 **Smart Link Checking**: Uses efficient HEAD requests first, falling back to GET requests when needed
 - ⚡ **Rate Limiting**: Configurable delays between requests to be respectful to servers
-- 📊 **Detailed Reporting**: Provides comprehensive reports of broken links with source pages and error details
+- 📊 **Detailed Reporting**: Provides comprehensive reports of broken links (HTTP 404/500 only) with source pages and error details
 - 🤖 **GitHub Actions Integration**: Automated daily checks with issue creation on failure
 - 🔧 **Configurable**: Customizable timeouts, delays, and target URLs
 
@@ -58,6 +58,25 @@ Options:
   --help           Show this message and exit
 ```
 
+## Link Status Code Handling
+
+The link verifier treats different HTTP status codes as follows:
+
+### ❌ **Broken Links (Reported as Errors)**
+- **HTTP 404** - Not Found
+- **HTTP 500** - Internal Server Error
+
+### ✅ **Acceptable Links (Not Reported as Errors)**
+- **HTTP 200** - OK
+- **HTTP 403** - Forbidden (access restricted but link exists)
+- **HTTP 301/302** - Redirects (followed automatically)
+- **HTTP 999** - LinkedIn anti-bot response
+- **Connection timeouts** - Treated as temporary issues
+- **Connection errors** - Treated as temporary issues
+- **All other HTTP status codes**
+
+This focused approach reduces false positives from sites that restrict access (like social media platforms) while still catching genuinely broken links.
+
 ## How It Works
 
 ### 1. Page Discovery
@@ -95,7 +114,8 @@ The tool provides:
 2024-01-15 09:00:03 - INFO - Found 15 pages to check
 2024-01-15 09:00:05 - INFO - Found 47 total links to verify
 2024-01-15 09:00:06 - INFO - ✓ Link OK: https://llm-d.ai/docs/installation
-2024-01-15 09:00:07 - WARNING - ✗ Link broken: https://example.com/broken - HTTP 404
+2024-01-15 09:00:07 - INFO - ✓ Link OK: https://x.com/example - HTTP 403
+2024-01-15 09:00:08 - WARNING - ✗ Link broken: https://llm-d.ai/missing-page - HTTP 404 - Not Found (found on: https://llm-d.ai)
 
 ============================================================
 LINK VERIFICATION RESULTS
@@ -105,12 +125,12 @@ Successful links: 46
 Broken links: 1
 
 ============================================================
-BROKEN LINKS FOUND:
+BROKEN LINKS FOUND (HTTP 404 & 500 ONLY):
 ============================================================
 
-❌ https://example.com/broken
-   Found on: https://llm-d.ai/docs
-   Error: HTTP 404
+❌ BROKEN LINK: https://llm-d.ai/missing-page
+   📄 Found on page: https://llm-d.ai
+   💥 Error: HTTP 404 - Not Found
 ```
 
 ## GitHub Actions Workflow Details
