@@ -137,25 +137,25 @@ class LinkVerifier:
             else:
                 error_msg = f"HTTP {response.status_code}"
                 self.broken_links[url].append((source_page, error_msg))
-                self.logger.warning(f"✗ Link broken: {url} - {error_msg}")
+                self.logger.warning(f"✗ Link broken: {url} - {error_msg} (found on: {source_page})")
                 return False
                 
         except requests.exceptions.Timeout:
             error_msg = "Timeout"
             self.broken_links[url].append((source_page, error_msg))
-            self.logger.warning(f"✗ Link timeout: {url}")
+            self.logger.warning(f"✗ Link timeout: {url} (found on: {source_page})")
             return False
             
         except requests.exceptions.ConnectionError:
             error_msg = "Connection error"
             self.broken_links[url].append((source_page, error_msg))
-            self.logger.warning(f"✗ Link connection error: {url}")
+            self.logger.warning(f"✗ Link connection error: {url} (found on: {source_page})")
             return False
             
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             self.broken_links[url].append((source_page, error_msg))
-            self.logger.warning(f"✗ Link error: {url} - {error_msg}")
+            self.logger.warning(f"✗ Link error: {url} - {error_msg} (found on: {source_page})")
             return False
 
     def verify_all_links(self) -> bool:
@@ -232,10 +232,10 @@ class LinkVerifier:
             self.logger.error(f"{'='*60}")
             
             for url, sources_and_errors in self.broken_links.items():
-                self.logger.error(f"\n❌ {url}")
+                self.logger.error(f"\n❌ BROKEN LINK: {url}")
                 for source, error in sources_and_errors:
-                    self.logger.error(f"   Found on: {source}")
-                    self.logger.error(f"   Error: {error}")
+                    self.logger.error(f"   📄 Found on page: {source}")
+                    self.logger.error(f"   💥 Error: {error}")
         else:
             self.logger.info("\n✅ All links are working properly!")
         
