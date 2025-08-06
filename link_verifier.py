@@ -12,6 +12,8 @@ import logging
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from typing import Dict, List, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
@@ -20,7 +22,7 @@ from bs4 import BeautifulSoup
 
 
 class LinkVerifier:
-    def __init__(self, base_url: str = "https://llm-d.ai", timeout: int = 30, delay: float = 1.0):
+    def __init__(self, base_url: str = "https://llm-d.ai", timeout: int = 30, delay: float = 1.0, max_workers: int = 10):
         """
         Initialize the Link Verifier.
         
@@ -28,19 +30,35 @@ class LinkVerifier:
             base_url: The base URL to start crawling from
             timeout: Timeout for HTTP requests in seconds
             delay: Delay between requests to be respectful to the server
+            max_workers: Maximum number of concurrent threads for link checking
         """
         self.base_url = base_url
         self.timeout = timeout
         self.delay = delay
+        self.max_workers = max_workers
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'llm-d-docs-verifier/1.0 (Link Checker)'
         })
         
-        # Track results
+        # Configure connection pooling for better performance
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=20,
+            pool_maxsize=100,
+            max_retries=1
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        
+        # Thread-safe data structures
         self.checked_links: Set[str] = set()
         self.broken_links: Dict[str, List[Tuple[str, str]]] = defaultdict(list)  # url -> [(source_page, error)]
         self.successful_links: Set[str] = set()
+        
+        # Thread locks for synchronization
+        self.checked_links_lock = Lock()
+        self.broken_links_lock = Lock()
+        self.successful_links_lock = Lock()
         
         # Setup logging
         logging.basicConfig(
@@ -104,7 +122,7 @@ class LinkVerifier:
 
     def check_link(self, url: str, source_page: str) -> bool:
         """
-        Check if a single link is working.
+        Check if a single link is working (thread-safe).
         
         Args:
             url: The URL to check
@@ -113,10 +131,12 @@ class LinkVerifier:
         Returns:
             True if link is working, False otherwise
         """
-        if url in self.checked_links:
-            return url in self.successful_links
-        
-        self.checked_links.add(url)
+        # Thread-safe check if already processed
+        with self.checked_links_lock:
+            if url in self.checked_links:
+                with self.successful_links_lock:
+                    return url in self.successful_links
+            self.checked_links.add(url)
         
         try:
             self.logger.info(f"Checking link: {url}")
@@ -133,17 +153,20 @@ class LinkVerifier:
             # Only treat 404 and 500 as broken links
             if response.status_code == 404:
                 error_msg = f"HTTP {response.status_code} - Not Found"
-                self.broken_links[url].append((source_page, error_msg))
+                with self.broken_links_lock:
+                    self.broken_links[url].append((source_page, error_msg))
                 self.logger.warning(f"✗ Link broken: {url} - {error_msg} (found on: {source_page})")
                 return False
             elif response.status_code == 500:
                 error_msg = f"HTTP {response.status_code} - Internal Server Error"
-                self.broken_links[url].append((source_page, error_msg))
+                with self.broken_links_lock:
+                    self.broken_links[url].append((source_page, error_msg))
                 self.logger.warning(f"✗ Link broken: {url} - {error_msg} (found on: {source_page})")
                 return False
             else:
                 # All other status codes (200, 403, 301, 302, etc.) are considered acceptable
-                self.successful_links.add(url)
+                with self.successful_links_lock:
+                    self.successful_links.add(url)
                 if response.status_code == 200:
                     self.logger.info(f"✓ Link OK: {url}")
                 else:
@@ -152,78 +175,140 @@ class LinkVerifier:
                 
         except requests.exceptions.Timeout:
             # Timeouts are not considered broken links, just inaccessible at the moment
-            self.successful_links.add(url)
+            with self.successful_links_lock:
+                self.successful_links.add(url)
             self.logger.info(f"⚠️  Link timeout (but not broken): {url} (found on: {source_page})")
             return True
             
         except requests.exceptions.ConnectionError:
             # Connection errors are not considered broken links, just inaccessible at the moment
-            self.successful_links.add(url)
+            with self.successful_links_lock:
+                self.successful_links.add(url)
             self.logger.info(f"⚠️  Link connection error (but not broken): {url} (found on: {source_page})")
             return True
             
         except Exception as e:
             # Other errors are not considered broken links, just inaccessible at the moment
-            self.successful_links.add(url)
+            with self.successful_links_lock:
+                self.successful_links.add(url)
             self.logger.info(f"⚠️  Link error (but not broken): {url} - {str(e)} (found on: {source_page})")
             return True
 
+    def get_all_pages_concurrent(self) -> List[str]:
+        """
+        Discover all internal pages concurrently.
+        
+        Returns:
+            List of page URLs to check
+        """
+        pages_to_check = [self.base_url]
+        checked_pages = set()
+        
+        # Process pages in batches to avoid overwhelming the server
+        batch_size = min(5, self.max_workers)
+        
+        while True:
+            # Get the next batch of unchecked pages
+            unchecked_pages = [p for p in pages_to_check if p not in checked_pages]
+            if not unchecked_pages:
+                break
+                
+            current_batch = unchecked_pages[:batch_size]
+            
+            # Process batch concurrently
+            with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                future_to_page = {executor.submit(self.get_links_from_page, page): page 
+                                for page in current_batch}
+                
+                for future in as_completed(future_to_page):
+                    page_url = future_to_page[future]
+                    checked_pages.add(page_url)
+                    
+                    try:
+                        links = future.result()
+                        
+                        # Filter for internal pages to add to crawling list
+                        for link in links:
+                            if (not self.is_external_link(link) and 
+                                link not in checked_pages and 
+                                link not in pages_to_check):
+                                # Only add if it's a different page (not just a fragment)
+                                parsed_link = urlparse(link)
+                                parsed_page = urlparse(page_url)
+                                if parsed_link.path != parsed_page.path:
+                                    pages_to_check.append(link)
+                                    self.logger.info(f"Found internal page: {link}")
+                    except Exception as e:
+                        self.logger.error(f"Error processing page {page_url}: {e}")
+            
+            # Small delay between batches to be respectful
+            if self.delay > 0 and unchecked_pages:
+                time.sleep(self.delay / 2)
+        
+        return pages_to_check
+
     def verify_all_links(self) -> bool:
         """
-        Main method to verify all links on the website.
+        Main method to verify all links on the website using concurrent processing.
         
         Returns:
             True if all links are working, False if any broken links found
         """
         self.logger.info(f"Starting link verification for {self.base_url}")
+        self.logger.info(f"Using {self.max_workers} concurrent workers")
         
-        # Get all pages to crawl (starting with the base URL)
-        pages_to_check = [self.base_url]
-        checked_pages = set()
-        
-        # First, crawl the main page and find internal pages
-        for page_url in pages_to_check:
-            if page_url in checked_pages:
-                continue
-                
-            checked_pages.add(page_url)
-            links = self.get_links_from_page(page_url)
-            
-            # Filter for internal pages to add to crawling list
-            for link in links:
-                if not self.is_external_link(link) and link not in checked_pages and link not in pages_to_check:
-                    # Only add if it's a different page (not just a fragment)
-                    parsed_link = urlparse(link)
-                    parsed_page = urlparse(page_url)
-                    if parsed_link.path != parsed_page.path:
-                        pages_to_check.append(link)
-                        self.logger.info(f"Found internal page: {link}")
-        
+        # Discover all pages concurrently
+        pages_to_check = self.get_all_pages_concurrent()
         self.logger.info(f"Found {len(pages_to_check)} pages to check")
         
-        # Now check all links found on all pages
+        # Collect all links from all pages concurrently
         all_links = []
-        for page_url in pages_to_check:
-            links = self.get_links_from_page(page_url)
-            for link in links:
-                all_links.append((link, page_url))
-                
-            time.sleep(self.delay)  # Be respectful to the server
+        
+        with ThreadPoolExecutor(max_workers=min(len(pages_to_check), self.max_workers)) as executor:
+            future_to_page = {executor.submit(self.get_links_from_page, page): page 
+                            for page in pages_to_check}
+            
+            for future in as_completed(future_to_page):
+                page_url = future_to_page[future]
+                try:
+                    links = future.result()
+                    for link in links:
+                        all_links.append((link, page_url))
+                except Exception as e:
+                    self.logger.error(f"Error getting links from {page_url}: {e}")
         
         self.logger.info(f"Found {len(all_links)} total links to verify")
         
-        # Check each unique link
+        # Create unique links dictionary
         unique_links = {}
         for link, source in all_links:
             if link not in unique_links:
                 unique_links[link] = []
             unique_links[link].append(source)
         
+        self.logger.info(f"Checking {len(unique_links)} unique links concurrently...")
+        
+        # Check all links concurrently
         success_count = 0
-        for url, sources in unique_links.items():
-            if self.check_link(url, sources[0]):  # Use first source for error reporting
-                success_count += 1
-            time.sleep(self.delay)  # Be respectful
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all link checking tasks
+            future_to_url = {
+                executor.submit(self.check_link, url, sources[0]): url 
+                for url, sources in unique_links.items()
+            }
+            
+            # Process completed tasks
+            for future in as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    if future.result():
+                        success_count += 1
+                except Exception as e:
+                    self.logger.error(f"Error checking link {url}: {e}")
+                    # Treat as broken
+                    with self.broken_links_lock:
+                        self.broken_links[url].append(("unknown", f"Error: {e}"))
         
         # Report results
         total_links = len(unique_links)
@@ -256,6 +341,7 @@ def main():
     parser.add_argument('--url', default='https://llm-d.ai', help='Base URL to check (default: https://llm-d.ai)')
     parser.add_argument('--timeout', type=int, default=30, help='Timeout for HTTP requests in seconds (default: 30)')
     parser.add_argument('--delay', type=float, default=1.0, help='Delay between requests in seconds (default: 1.0)')
+    parser.add_argument('--max-workers', type=int, default=10, help='Maximum number of concurrent workers (default: 10)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     
     args = parser.parse_args()
@@ -266,7 +352,8 @@ def main():
     verifier = LinkVerifier(
         base_url=args.url,
         timeout=args.timeout,
-        delay=args.delay
+        delay=args.delay,
+        max_workers=args.max_workers
     )
     
     success = verifier.verify_all_links()
