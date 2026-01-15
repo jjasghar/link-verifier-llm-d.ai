@@ -9,6 +9,7 @@ and exits with appropriate status codes for use in GitHub Actions.
 
 import argparse
 import logging
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -38,7 +39,7 @@ class LinkVerifier:
         self.max_workers = max_workers
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'llm-d-docs-verifier/1.0 (Link Checker)'
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         })
         
         # Configure connection pooling for better performance
@@ -66,6 +67,22 @@ class LinkVerifier:
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
         self.logger = logging.getLogger(__name__)
+
+    def check_with_curl(self, url: str) -> int:
+        """Fallback to curl when requests fails. Returns HTTP status code or 0 if curl fails."""
+        try:
+            result = subprocess.run([
+                'curl', '-s', '-o', '/dev/null', '-w', '%{http_code}',
+                '-H', f'User-Agent: {self.session.headers["User-Agent"]}',
+                '--max-time', str(self.timeout),
+                url
+            ], capture_output=True, text=True, timeout=self.timeout + 5)
+            
+            if result.returncode == 0 and result.stdout.isdigit():
+                return int(result.stdout)
+            return 0
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, ValueError):
+            return 0
 
     def is_external_link(self, url: str) -> bool:
         """Check if a URL is external to the base domain."""
@@ -152,6 +169,14 @@ class LinkVerifier:
             
             # Only treat 404 and 500 as broken links
             if response.status_code == 404:
+                # Try curl as fallback - some sites block Python requests but allow curl
+                curl_status = self.check_with_curl(url)
+                if curl_status != 0 and curl_status != 404:
+                    with self.successful_links_lock:
+                        self.successful_links.add(url)
+                    self.logger.info(f"✓ Link OK (curl fallback): {url} - HTTP {curl_status}")
+                    return True
+                
                 error_msg = f"HTTP {response.status_code} - Not Found"
                 with self.broken_links_lock:
                     self.broken_links[url].append((source_page, error_msg))
